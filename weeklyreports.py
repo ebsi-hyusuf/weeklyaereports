@@ -1,161 +1,325 @@
+#!/usr/bin/env python3
 """
-Weekly OE Report Automation Script
-Author: Hamza Yusuf
-Description:
-    Automates the 3-week report (Last, This, Next Week) for client activity and lives counts.
-    Reads your weekly Excel export (Asof_YYYY-MM-DD.xlsx) and produces:
-        - Clients Going Live
-        - Clients Active
-        - Clients Completed
-        - Lives Active (Not Confirmed)
-        - Lives Confirmed & Complete
-    Works entirely off ControlId, Start/End Dates, and population logic.
+Weekly OE Report Automation Script (Date-normalized)
+Author: Hamza Yusuf + ChatGPT
 """
 
-import pandas as pd
-from datetime import datetime, timedelta
+import argparse
 import os
+from datetime import datetime, timedelta, date
+import pandas as pd
+import numpy as np
 
-# === CONFIGURATION ==========================================================
-# Automatically detect the most recent Excel file in the same folder as this script
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# ===================== CONFIG =====================
 
-excel_files = [
-    os.path.join(SCRIPT_DIR, f)
-    for f in os.listdir(SCRIPT_DIR)
-    if f.lower().endswith(".xlsx")
+SHEET_NAME = "OE Counts"
+
+START_FALLBACKS = [
+    "Window Start from CDR",
+    "OE Window Start from CDR",
+    "Window Start from SYS",
+    "Window Start from System",
+    "Window Start (SYS)",
+    "Window Start from Config",
+    "Window Start (Config)",
+    "Config Window Start",
+    "Window Start",
+]
+END_FALLBACKS = [
+    "Window End from CDR",
+    "OE Window End from CDR",
+    "Window End from SYS",
+    "Window End from System",
+    "Window End (SYS)",
+    "Window End from Config",
+    "Window End (Config)",
+    "Config Window End",
+    "Window End",
 ]
 
-if not excel_files:
-    raise FileNotFoundError("No Excel file (.xlsx) found in this folder!")
+CONTROL_ID_COL = "ControlId"
+POP_TYPE_COL   = "Population Type"
+POP_SIZE_COL   = "Population Size"
+OE_TOTAL_COL   = "Total OE Count"
+CONFIRMED_COL  = "Confirmed OE Events"
 
-# Pick the most recently modified Excel file
-EXCEL_FILE = max(excel_files, key=os.path.getmtime)
-
-print(f"\nUsing Excel file: {EXCEL_FILE}\n")
-# ============================================================================
+POP_PRIORITY = ["Active", "COBRA", "Retiree"]
+# ==================================================
 
 
-def get_week_ranges(base_date=None):
-    """Get last, this, and next week (Monday–Sunday) date ranges."""
-    today = base_date or datetime.today()
-    monday = today - timedelta(days=today.weekday())
-    last_week_start = monday - timedelta(days=7)
-    this_week_start = monday
-    next_week_start = monday + timedelta(days=7)
+def find_latest_excel(directory: str) -> str:
+    xlsx = [os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith(".xlsx")]
+    if not xlsx:
+        raise FileNotFoundError("No Excel file (.xlsx) found in this folder!")
+    return max(xlsx, key=os.path.getmtime)
 
-    def week_range(start):
-        return (start, start + timedelta(days=6))
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Weekly OE 3-week report")
+    p.add_argument("--excel", help="Path to the OE export (.xlsx). Default: most recent .xlsx in script folder.")
+    p.add_argument("--sheet", default=SHEET_NAME, help=f"Worksheet name (default: {SHEET_NAME})")
+    p.add_argument("--auto", action="store_true", help="Auto-detect current Monday–Sunday as 'this week'.")
+    p.add_argument("--start", help="Week start (YYYY-MM-DD). Must be a Monday.")
+    p.add_argument("--end",   help="Week end (YYYY-MM-DD). Must be a Sunday.")
+    p.add_argument("--export", help="Optional path to export an Excel summary.")
+    p.add_argument("--with-details", action="store_true", help="If exporting, include detail tabs.")
+    return p.parse_args()
+
+
+def monday_of(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def three_week_ranges(this_week_start: date):
+    """Return dict of week ranges (start_date, end_date) as DATE objects (Mon..Sun)."""
+    last = this_week_start - timedelta(days=7)
+    nxt  = this_week_start + timedelta(days=7)
     return {
-        "Last Week": week_range(last_week_start),
-        "This Week": week_range(this_week_start),
-        "Next Week": week_range(next_week_start),
+        "Last Week": (last, last + timedelta(days=6)),
+        "This Week": (this_week_start, this_week_start + timedelta(days=6)),
+        "Next Week": (nxt,  nxt + timedelta(days=6)),
     }
 
 
-def load_and_clean_excel(path):
-    df = pd.read_excel(path, sheet_name="OE Counts")
+def normalize_pop_type(val: str) -> str:
+    if not isinstance(val, str):
+        return "Unknown"
+    v = val.strip().lower()
+    if "active" in v or v == "act":
+        return "Active"
+    if "cobra" in v or v == "cob":
+        return "COBRA"
+    if "ret" in v:  # retiree, ret, retirees
+        return "Retiree"
+    return val.strip().title()
 
-    # Normalize text and handle missing data
-    df.columns = [c.strip() for c in df.columns]
+
+def coalesce_dates(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    cols_present = [c for c in candidates if c in df.columns]
+    if not cols_present:
+        return pd.to_datetime(pd.Series([pd.NaT] * len(df)), errors="coerce")
+    as_dt = df[cols_present].apply(pd.to_datetime, errors="coerce")
+    return as_dt.bfill(axis=1).iloc[:, 0]
+
+
+def load_and_clean_excel(path: str, sheet: str) -> pd.DataFrame:
+    df = pd.read_excel(path, sheet_name=sheet)
+    df.columns = [str(c).strip() for c in df.columns]
     df.replace("No date configured", pd.NA, inplace=True)
 
-    # Convert to proper data types
-    date_cols = ["Window Start from CDR", "Window End from CDR"]
-    for col in date_cols:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+    if CONTROL_ID_COL not in df.columns:
+        raise KeyError(f"Missing required column: {CONTROL_ID_COL}")
 
-    df["Population Type"] = df["Population Type"].str.strip().fillna("Unknown")
-    df["Population Size"] = pd.to_numeric(df["Population Size"], errors="coerce").fillna(0)
-    df["Total OE Count"] = pd.to_numeric(df["Total OE Count"], errors="coerce").fillna(0)
-    df["Confirmed OE Events"] = pd.to_numeric(df["Confirmed OE Events"], errors="coerce").fillna(0)
-    return df
+    df[CONTROL_ID_COL] = df[CONTROL_ID_COL].astype(str).str.strip()
+    if POP_TYPE_COL in df.columns:
+        df[POP_TYPE_COL] = df[POP_TYPE_COL].apply(normalize_pop_type)
+    else:
+        df[POP_TYPE_COL] = "Unknown"
 
+    for c in (POP_SIZE_COL, OE_TOTAL_COL, CONFIRMED_COL):
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-def get_clients_going_live(df, start, end):
-    """Unique ControlIds starting within week range."""
-    mask = (df["Window Start from CDR"] >= start) & (df["Window Start from CDR"] <= end)
-    filtered = df[mask]
-    # Keep only Active where duplicate Active/Retiree exist
-    filtered = filtered.sort_values(by=["Population Type"], ascending=True)
-    filtered = filtered.drop_duplicates(subset=["ControlId"], keep="first")
-    return filtered
+    # Build Start/End with CDR -> SYS/Config fallback
+    df["__Start"] = coalesce_dates(df, START_FALLBACKS)
+    df["__End"]   = coalesce_dates(df, END_FALLBACKS)
 
+    # If one bound missing, mirror the other to make a 1-day window
+    df.loc[df["__Start"].isna(), "__Start"] = df.loc[df["__Start"].isna(), "__End"]
+    df.loc[df["__End"].isna(), "__End"]     = df.loc[df["__End"].isna(), "__Start"]
 
-def get_active_clients(df, start, end):
-    """Clients whose window overlaps week."""
-    mask = (df["Window Start from CDR"] <= end) & (df["Window End from CDR"] >= start)
-    filtered = df[mask]
-    filtered = filtered.sort_values(by=["Population Type"], ascending=True)
-    filtered = filtered.drop_duplicates(subset=["ControlId"], keep="first")
-    return filtered
+    # Drop invalid windows
+    df = df[df["__End"] >= df["__Start"]].copy()
 
+    # Date-only columns for comparisons (CRITICAL FIX)
+    df["__Start_d"] = pd.to_datetime(df["__Start"]).dt.date
+    df["__End_d"]   = pd.to_datetime(df["__End"]).dt.date
 
-def get_completed_clients(df, start):
-    """Clients whose window ended before current week."""
-    mask = df["Window End from CDR"] < start
-    filtered = df[mask]
-    filtered = filtered.drop_duplicates(subset=["ControlId"])
-    return filtered
+    return df.reset_index(drop=True)
 
 
-def calc_lives_active(df):
-    """Calculate lives active (Total OE - Confirmed; if OE=0 use Population Size)."""
-    def logic(row):
-        if row["Total OE Count"] == 0:
-            return row["Population Size"]
-        return row["Total OE Count"] - row["Confirmed OE Events"]
+# ---------- Filters (population-level; use DATE comparisons) ----------
 
-    return df.apply(logic, axis=1).sum()
+def rows_going_live(df: pd.DataFrame, start_d: date, end_d: date) -> pd.DataFrame:
+    return df[(df["__Start_d"] >= start_d) & (df["__Start_d"] <= end_d)].copy()
 
+def rows_active(df: pd.DataFrame, start_d: date, end_d: date) -> pd.DataFrame:
+    # Overlap on dates: start <= week_end AND end >= week_start
+    return df[(df["__Start_d"] <= end_d) & (df["__End_d"] >= start_d)].copy()
 
-def calc_lives_confirmed(df, end):
-    """Sum confirmed events since 9/8 up to report end."""
-    mask = (df["Window Start from CDR"] >= datetime(end.year, 9, 8)) & (df["Window Start from CDR"] <= end)
-    return df.loc[mask, "Confirmed OE Events"].sum()
+def rows_completed(df: pd.DataFrame, week_start_d: date) -> pd.DataFrame:
+    return df[df["__End_d"] < week_start_d].copy()
 
 
-def generate_summary(df, week_ranges):
-    summary = []
-    for label, (start, end) in week_ranges.items():
-        going_live = get_clients_going_live(df, start, end)
-        active = get_active_clients(df, start, end)
-        completed = get_completed_clients(df, start)
+# ---------- Client counting (dedupe by ControlId with population priority) ----------
+
+def dedupe_clients_for_count(df: pd.DataFrame) -> pd.DataFrame:
+    order = {p: i for i, p in enumerate(POP_PRIORITY)}
+    df = df.copy()
+    df["__pop_order"] = df[POP_TYPE_COL].map(lambda p: order.get(p, len(order)))
+    df.sort_values([CONTROL_ID_COL, "__pop_order"], inplace=True)
+    out = df.drop_duplicates(subset=[CONTROL_ID_COL], keep="first")
+    return out.drop(columns=["__pop_order"])
+
+def count_unique_clients(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    return dedupe_clients_for_count(df)[CONTROL_ID_COL].nunique()
+
+
+# ---------- Lives calculations (population-level, clamp negatives) ----------
+
+def calc_lives_active(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    oe   = pd.to_numeric(df[OE_TOTAL_COL], errors="coerce").fillna(0)
+    conf = pd.to_numeric(df[CONFIRMED_COL], errors="coerce").fillna(0)
+    pop  = pd.to_numeric(df[POP_SIZE_COL], errors="coerce").fillna(0)
+    lives = np.where(oe > 0, oe - conf, pop)
+    return int(np.maximum(lives, 0).sum())
+
+
+def calc_lives_confirmed_for_active(df_active: pd.DataFrame, week_end_d: date) -> int:
+    if df_active.empty:
+        return 0
+    start_cutoff = date(week_end_d.year, 9, 8)
+    mask = (df_active["__Start_d"] >= start_cutoff) & (df_active["__Start_d"] <= week_end_d)
+    return int(pd.to_numeric(df_active.loc[mask, CONFIRMED_COL], errors="coerce").fillna(0).sum())
+
+
+# ---------- Next-week projection helpers ----------
+
+def continuing_next_week(df: pd.DataFrame, next_start_d: date, next_end_d: date) -> pd.DataFrame:
+    nxt_active = rows_active(df, next_start_d, next_end_d)
+    return nxt_active[nxt_active["__Start_d"] < next_start_d].copy()
+
+def new_go_lives_next_week(df: pd.DataFrame, next_start_d: date, next_end_d: date) -> pd.DataFrame:
+    return rows_going_live(df, next_start_d, next_end_d)
+
+def sum_new_client_popsize_with_guard(new_rows: pd.DataFrame) -> int:
+    if new_rows.empty:
+        return 0
+    total = 0
+    for cid, g in new_rows.groupby(CONTROL_ID_COL, dropna=False):
+        g = g.copy()
+        g["__pop_est"] = np.where(
+            pd.to_numeric(g[POP_SIZE_COL], errors="coerce").fillna(0) > 0,
+            pd.to_numeric(g[POP_SIZE_COL], errors="coerce").fillna(0),
+            pd.to_numeric(g[OE_TOTAL_COL], errors="coerce").fillna(0),
+        )
+        by_type = g.groupby(POP_TYPE_COL)["__pop_est"].sum().to_dict()
+        active  = float(by_type.get("Active", 0))
+        retiree = float(by_type.get("Retiree", 0))
+        cobra   = float(by_type.get("COBRA", 0))
+        others  = float(sum(v for k, v in by_type.items() if k not in {"Active", "Retiree", "COBRA"}))
+        if active > 0 and retiree > active:
+            retiree = active
+        total += int(round(active + retiree + cobra + others))
+    return total
+
+
+# ---------- Summary builder ----------
+
+def build_summary(df: pd.DataFrame, ranges: dict[str, tuple[date, date]]) -> tuple[pd.DataFrame, dict]:
+    rows = []
+    details = {}
+
+    for label, (start_d, end_d) in ranges.items():
+        going = rows_going_live(df, start_d, end_d)
+        active = rows_active(df, start_d, end_d)
+        completed = rows_completed(df, start_d)
+
+        clients_going_cnt = count_unique_clients(going)
+        clients_active_cnt = count_unique_clients(active)
+        clients_completed_cnt = count_unique_clients(completed)
 
         lives_active = calc_lives_active(active)
-        lives_confirmed = calc_lives_confirmed(active, end)
+        lives_confirmed = calc_lives_confirmed_for_active(active, end_d)
 
-        summary.append({
-            "Week": f"{start.strftime('%m/%d')} - {end.strftime('%m/%d')}",
-            "Clients Going Live": len(going_live["ControlId"].unique()),
-            "Clients Active": len(active["ControlId"].unique()),
-            "Clients Completed": len(completed["ControlId"].unique()),
+        rows.append({
+            "Week": f"{start_d.strftime('%m/%d')} - {end_d.strftime('%m/%d')}",
+            "Clients Going Live": clients_going_cnt,
+            "Clients Active": clients_active_cnt,
+            "Clients Completed": clients_completed_cnt,
             "Lives Active (Not Confirmed)": lives_active,
             "Lives Confirmed & Complete": lives_confirmed,
         })
 
-    # Predict next week lives: add this week's lives + next week's populations
-    this_lives = summary[1]["Lives Active (Not Confirmed)"]
-    next_clients = get_clients_going_live(df, *week_ranges["Next Week"])
-    next_pred = this_lives + next_clients["Population Size"].sum()
-    summary[2]["Lives Active (Not Confirmed)"] = next_pred
+        details[label] = {
+            "going_live_rows": going.sort_values([CONTROL_ID_COL, POP_TYPE_COL, "__Start"]),
+            "active_rows": active.sort_values([CONTROL_ID_COL, POP_TYPE_COL, "__Start"]),
+            "completed_rows": completed.sort_values([CONTROL_ID_COL, POP_TYPE_COL, "__End"]),
+        }
 
-    return pd.DataFrame(summary)
+    # Next-week projection (replace Lives Active for "Next Week")
+    nw_start_d, nw_end_d = ranges["Next Week"]
+    cont = continuing_next_week(df, nw_start_d, nw_end_d)
+    newn = new_go_lives_next_week(df, nw_start_d, nw_end_d)
+    projected = calc_lives_active(cont) + sum_new_client_popsize_with_guard(newn)
+    rows[2]["Lives Active (Not Confirmed)"] = projected
+
+    return pd.DataFrame(rows), details
+
+
+def export_summary(path: str, summary_df: pd.DataFrame, details: dict, include_details: bool):
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        summary_df.to_excel(xw, index=False, sheet_name="Summary")
+        if include_details:
+            for label, tabs in details.items():
+                safe_label = label.replace(" ", "_")
+                tabs["going_live_rows"].to_excel(xw, index=False, sheet_name=f"{safe_label}_Going")
+                tabs["active_rows"].to_excel(xw, index=False, sheet_name=f"{safe_label}_Active")
+                tabs["completed_rows"].to_excel(xw, index=False, sheet_name=f"{safe_label}_Completed")
 
 
 def main():
-    print("Loading Excel file...")
-    df = load_and_clean_excel(EXCEL_FILE)
-    print(f"Loaded {len(df)} rows.\n")
+    args = parse_args()
 
-    week_ranges = get_week_ranges()
-    summary_df = generate_summary(df, week_ranges)
+    # Excel path
+    if args.excel:
+        excel_path = args.excel
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        excel_path = find_latest_excel(script_dir)
 
-    # === Terminal Output Only ===
+    print(f"\nUsing Excel file: {excel_path}")
+    df = load_and_clean_excel(excel_path, args.sheet)
+    print(f"Loaded {len(df):,} rows from sheet '{args.sheet}'.\n")
+
+    # Determine week window *as dates*, not datetimes
+    if args.auto:
+        today_d = datetime.today().date()
+        this_monday_d = monday_of(today_d)
+        start_d, end_d = this_monday_d, this_monday_d + timedelta(days=6)
+    elif args.start and args.end:
+        start_d = datetime.strptime(args.start, "%Y-%m-%d").date()
+        end_d   = datetime.strptime(args.end, "%Y-%m-%d").date()
+        if start_d.weekday() != 0 or end_d.weekday() != 6:
+            print("WARNING: Weeks are Monday–Sunday. You passed non-Mon/Sun dates.")
+        if end_d < start_d:
+            raise ValueError("End date is before start date.")
+    else:
+        today_d = datetime.today().date()
+        this_monday_d = monday_of(today_d)
+        start_d, end_d = this_monday_d, this_monday_d + timedelta(days=6)
+
+    ranges = three_week_ranges(start_d)
+
+    # Helpful: echo exact bounds (for sanity)
+    for lbl, (s, e) in ranges.items():
+        print(f"{lbl}: {s} -> {e}")
+
+    summary_df, details = build_summary(df, ranges)
+
     print("\n=== Weekly OE Summary ===\n")
     print(summary_df.to_string(index=False))
-    print("\n(No Excel file exported — terminal output only.)\n")
+
+    if args.export:
+        export_summary(args.export, summary_df, details, include_details=args.with_details)
+        print(f"\nExported: {args.export}\n")
+
+    
 
 
 if __name__ == "__main__":
