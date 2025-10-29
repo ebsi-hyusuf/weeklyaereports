@@ -48,7 +48,7 @@ Make sure your Excel file (for example Asof_2025-10-26.xlsx) is in the same fold
 Open VS Code or a terminal in that folder.
 
 Run:
- python-weekly-clients.py
+ python-weelky-clients.py
 
 
 The terminal will show something like:
