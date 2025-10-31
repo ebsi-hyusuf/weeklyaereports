@@ -6,8 +6,8 @@ EXCEL_FILE = "Asof_2025-10-30.xlsx"
 SHEET_NAME = "OE Counts"
 
 # choose week manually
-week_start = datetime(2025, 10, 27).date()
-week_end   = datetime(2025, 11, 2).date()
+week_start = datetime(2025, 11, 3).date()
+week_end   = datetime(2025, 11, 9).date()
 
 
 def dedupe_clients(df: pd.DataFrame) -> pd.DataFrame:
@@ -37,9 +37,7 @@ active = rows_active(df, week_start, week_end)
 going = dedupe_clients(going)
 active = dedupe_clients(active)
 
-
 # Print results
-
 print(f"\n=== CLIENTS GOING LIVE ({len(going)} unique) ===")
 print(going[["ControlId","Population Type","Population Size",
              "Total OE Count","Confirmed OE Events","__Start","__End"]]
@@ -49,3 +47,23 @@ print(f"\n=== CLIENTS ACTIVE ({len(active)} unique) ===")
 print(active[["ControlId","Population Type","Population Size",
               "Total OE Count","Confirmed OE Events","__Start","__End"]]
       .to_string(index=False))
+
+# --- NEW: Export exactly what's printed in terminal to Excel ---
+output_file = f"Weekly_Results_{week_start}_to_{week_end}.xlsx"
+
+cols_to_export = [
+    "ControlId",
+    "Population Type",
+    "Population Size",
+    "Total OE Count",
+    "Confirmed OE Events",
+    "__Start",
+    "__End"
+]
+
+with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+    going[cols_to_export].to_excel(writer, sheet_name="Going Live", index=False)
+    active[cols_to_export].to_excel(writer, sheet_name="Active", index=False)
+
+print(f"\nResults (same as terminal) saved to: {output_file}")
+# --------------------------------------------------------------
