@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Weekly OE Report Automation Script (Date-normalized)
-Author: Hamza Yusuf + ChatGPT
+Author: Hamza Yusuf
 """
 
 import argparse

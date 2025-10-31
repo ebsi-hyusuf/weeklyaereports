@@ -2,12 +2,12 @@ import pandas as pd
 from datetime import datetime
 from weeklyreports import load_and_clean_excel, rows_going_live, rows_active
 
-EXCEL_FILE = "Asof_2025-10-26.xlsx"
+EXCEL_FILE = "Asof_2025-10-30.xlsx"
 SHEET_NAME = "OE Counts"
 
 # choose week manually
-week_start = datetime(2025, 11, 3).date()
-week_end   = datetime(2025, 11, 9).date()
+week_start = datetime(2025, 10, 27).date()
+week_end   = datetime(2025, 11, 2).date()
 
 
 def dedupe_clients(df: pd.DataFrame) -> pd.DataFrame:
